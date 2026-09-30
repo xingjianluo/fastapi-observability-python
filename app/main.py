@@ -1,17 +1,24 @@
-"""FastAPI 应用装配：路由、中间件、异常处理器、健康检查与指标端点。"""
+"""FastAPI 应用装配：路由、中间件、异常处理器、健康检查、指标与档案回查端点。"""
 from __future__ import annotations
 
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from app.archive import archive
 from app.config import get_settings
 from app.context import get_correlation_id
 from app.dependencies import VALID_MODES, dependency
 from app.errors import AppError, normalize_exception, to_error_payload
 from app.logging_config import configure_logging, get_logger
 from app.metrics import registry
-from app.middleware import CorrelationIdMiddleware, MetricsMiddleware
+from app.middleware import (
+    ArchiveMiddleware,
+    CatchAllErrorMiddleware,
+    CorrelationIdMiddleware,
+    MetricsMiddleware,
+)
+from app.resilience import breaker
 
 logger = get_logger("app.request")
 
@@ -24,10 +31,22 @@ def create_app() -> FastAPI:
     settings = get_settings()
     configure_logging(settings.log_level)
     dependency.set_mode(settings.dependency_mode)
+    archive.resize(settings.archive_max_records)
+    breaker.configure(
+        fail_threshold=settings.breaker_fail_threshold,
+        window_size=settings.breaker_window_size,
+        fail_ratio=settings.breaker_fail_ratio,
+        cooldown_s=settings.breaker_cooldown_s,
+    )
+    breaker.reset()
 
     app = FastAPI(title=settings.service_name)
-    # 注意：后 add 的中间件先执行，Metrics 在内层保证拿到路由模板
+    # 执行顺序由外到内：Correlation -> Archive -> Metrics -> CatchAll -> 路由。
+    # CatchAll 在标识所在 Context 任务内兜住未预期异常，使 500 兜底响应、
+    # 日志、响应头、档案看到的标识完全一致；Metrics/Archive 据其 500 响应归档统计。
+    app.add_middleware(CatchAllErrorMiddleware)
     app.add_middleware(MetricsMiddleware)
+    app.add_middleware(ArchiveMiddleware)
     app.add_middleware(CorrelationIdMiddleware)
 
     @app.exception_handler(AppError)
@@ -92,12 +111,43 @@ def create_app() -> FastAPI:
         code = 503 if dep_health == "down" else 200
         return JSONResponse(
             status_code=code,
-            content={"status": status, "dependency": dep_health},
+            content={
+                "status": status,
+                "dependency": dep_health,
+                "circuit": breaker.snapshot(),
+            },
         )
 
     @app.get("/metrics")
     async def metrics() -> dict:
         return registry.snapshot()
+
+    @app.get("/observability/requests/{correlation_id}")
+    async def get_request_archive(correlation_id: str) -> JSONResponse:
+        """按请求标识回查一份观测档案；查无（含已淘汰）返回 404。"""
+        record = archive.get(correlation_id)
+        if record is None:
+            cid = get_correlation_id()
+            logger.info(
+                "request archive miss",
+                extra={
+                    "extra_fields": {
+                        "event": "request.archive_miss",
+                        "lookup_correlation_id": correlation_id,
+                    }
+                },
+            )
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": {
+                        "type": "not_found",
+                        "message": f"no archived request for correlation_id={correlation_id}",
+                        "correlation_id": cid,
+                    }
+                },
+            )
+        return JSONResponse(status_code=200, content=record.to_dict())
 
     @app.post("/admin/dependency-mode")
     async def set_dependency_mode(body: DependencyModeIn) -> dict:

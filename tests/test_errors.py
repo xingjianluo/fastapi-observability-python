@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import logging
 
-import pytest
-
 from app.dependencies import dependency
 from app.main import app
 

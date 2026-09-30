@@ -13,7 +13,7 @@ async def test_valid_correlation_id_is_propagated(client):
     cid = "order-abc-12345678"
     print(f"[输入] 请求头 X-Correlation-ID={cid!r}（符合 {VALID_PATTERN.pattern}）")
     resp = await client.get("/items/1", headers={"X-Correlation-ID": cid})
-    print(f"[判定依据] 状态码=200 且响应体与响应头中的 correlation_id 均等于输入值 -> 标识被原样沿用")
+    print("[判定依据] 状态码=200 且响应体与响应头中的 correlation_id 均等于输入值 -> 标识被原样沿用")
     assert resp.status_code == 200
     assert resp.json()["correlation_id"] == cid
     assert resp.headers["X-Correlation-ID"] == cid

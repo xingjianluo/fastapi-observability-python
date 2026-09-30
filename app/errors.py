@@ -71,3 +71,32 @@ def to_error_payload(exc: AppError, correlation_id: str | None = None) -> dict:
             "correlation_id": correlation_id,
         }
     }
+
+
+def classify_outcome(status_code: int) -> str:
+    """按最终状态码把请求结果归入统一口径（档案 outcome 字段用）。
+
+    成功 / 业务被拒 / 依赖超时 / 依赖出错 / 兜底未预期错误；
+    其余 4xx（如 404、405）归为 client_error。与错误分类状态码映射保持一致。
+    """
+    if status_code < 400:
+        return "success"
+    if status_code == 504:
+        return "dependency_timeout"
+    if status_code == 502:
+        return "dependency_error"
+    if status_code == 422:
+        return "business_rejected"
+    if status_code < 500:
+        return "client_error"
+    return "unexpected_error"
+
+
+def error_type_for_status(status_code: int) -> str | None:
+    """按状态码反查错误分类（与 AppError 子类一一对应），成功/4xx 其余返回 None。"""
+    return {
+        422: "business_rejected",
+        504: "dependency_timeout",
+        502: "dependency_error",
+        500: "unexpected_error",
+    }.get(status_code)
