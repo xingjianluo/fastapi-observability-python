@@ -4,11 +4,12 @@
   timestamp / level / logger / message / correlation_id
 额外上下文通过 extra={"extra_fields": {...}} 传入，平铺到顶层。
 """
+
 from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.context import get_correlation_id
 
@@ -19,8 +20,10 @@ class JsonFormatter(logging.Formatter):
     """把 LogRecord 序列化为单行 JSON，字段稳定。"""
 
     def format(self, record: logging.LogRecord) -> str:
+        # 先铺基础字段；extra_fields 中显式给出的 correlation_id 优先
+        # （异常处理器可能运行在独立上下文，自动注入会取到 None）
         payload: dict = {
-            "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "timestamp": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -29,7 +32,7 @@ class JsonFormatter(logging.Formatter):
         extra = getattr(record, "extra_fields", None)
         if isinstance(extra, dict):
             for key, value in extra.items():
-                if key not in RESERVED:
+                if key not in RESERVED or key == "correlation_id":
                     payload[key] = value
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)

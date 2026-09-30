@@ -9,6 +9,7 @@
 对外响应只暴露 error_type / message / correlation_id，
 内部细节（堆栈、原始异常）仅通过 cause 保留在服务端日志中。
 """
+
 from __future__ import annotations
 
 
@@ -20,7 +21,9 @@ class AppError(Exception):
     #: 对外是否展示 message（未预期异常不展示，避免泄露内部细节）
     expose_message: bool = True
 
-    def __init__(self, message: str = "", *, cause: BaseException | None = None) -> None:
+    def __init__(
+        self, message: str = "", *, cause: BaseException | None = None
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.cause = cause

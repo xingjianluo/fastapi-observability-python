@@ -4,6 +4,7 @@
 - snapshot() 返回一致性快照，供 /metrics 端点与测试断言；
 - reset() 供测试隔离使用。
 """
+
 from __future__ import annotations
 
 import threading
@@ -19,7 +20,9 @@ class MetricsRegistry:
         # key: (method, route, status_code) -> (total_ms, max_ms)
         self._latency: dict[tuple[str, str, int], tuple[float, float]] = {}
 
-    def record_request(self, method: str, route: str, status_code: int, latency_ms: float) -> None:
+    def record_request(
+        self, method: str, route: str, status_code: int, latency_ms: float
+    ) -> None:
         """记录一次请求。每次调用恰好计数一次，重复调用需调用方保证幂等。"""
         key = (method, route, status_code)
         with self._lock:
