@@ -6,7 +6,10 @@
 
 状态通过 set_mode 切换，健康检查据此报告 ok / degraded / down。
 熔断器（app.resilience）在此之上：连续失败或近期失败率过高时，
-fetch 不再真正等待下游，而是立即抛出 DependencyError（502 口径不变）快速失败。
+fetch 不再真正等待下游，而是立即快速失败。快速失败沿用「触发本轮降级的
+那一类失败」口径：因持续超时降级 -> DependencyTimeout/504，因下游出错
+降级 -> DependencyError/502，与真正调用下游失败时完全一致，不换分类、
+不泄露内部判断细节。
 """
 from __future__ import annotations
 
@@ -46,13 +49,21 @@ class SimulatedDependency:
     async def fetch(self, key: str) -> dict:
         """模拟一次下游调用，按当前模式返回或抛出归一化异常。
 
-        熔断打开/半开排队中时立即快速失败（DependencyError/502），不等待下游、
-        不计入失败统计（CircuitOpen 路径不调用 record_*）。
+        熔断打开/半开排队中时立即快速失败，不等待下游、不计入失败统计
+        （CircuitOpen 路径不调用 record_*）。快速失败的错误分类与状态码
+        沿用触发本轮降级的失败类别：持续超时降级 -> 504 dependency_timeout；
+        持续出错降级 -> 502 dependency_error。对调用方而言与真实下游失败
+        完全同构，且不暴露「熔断/快速失败」这一内部判断。
         """
-        if not breaker.allow_request():
+        allowed, fast_fail_kind = breaker.check_request()
+        if not allowed:
             fast_fail = CircuitOpen("circuit open; fast-fail without calling downstream")
+            if fast_fail_kind == "timeout":
+                raise DependencyTimeout(
+                    "dependency timed out", cause=fast_fail
+                ) from fast_fail
             raise DependencyError(
-                "dependency temporarily unavailable", cause=fast_fail
+                "dependency returned an error", cause=fast_fail
             ) from fast_fail
         mode = self.mode
         try:
@@ -69,10 +80,10 @@ class SimulatedDependency:
             else:
                 await asyncio.sleep(self._latency_ms / 1000.0)
         except DependencyError:
-            breaker.record_failure()
+            breaker.record_failure("error")
             raise
         except DependencyTimeout:
-            breaker.record_failure()
+            breaker.record_failure("timeout")
             raise
         else:
             breaker.record_success()
