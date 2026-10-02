@@ -97,17 +97,39 @@ curl http://127.0.0.1:8000/observability/requests/my-trace-001
 - 试探失败 -> 立即重新 `open` 并重新计时，不会在正常/降级之间来回抖；
 - 快速失败不是真实下游调用，不计入失败窗口，不会自我强化降级。
 
-快速失败的对外表现（与现有口径完全一致、不泄露内部细节）：
+快速失败的对外口径（与真实失败完全一致、不泄露内部细节）：
 
-- HTTP 502，错误响应体 `error.type = dependency_error`，
-  不出现 `CircuitOpen`、下游内部原因等字样；
+- **同一类失败，降级快速返回前后看到的分类和状态码一致**——熔断器会记住
+  触发降级（以及最近一次真实失败）的失败类别：
+  - 依赖**持续超时**打穿降级：真实调用与快速失败都是
+    `504 dependency_timeout`，不会因为不再等待下游就换成 502；
+  - 依赖**持续出错**打穿降级：真实调用与快速失败都是
+    `502 dependency_error`；
+  - 无论是「连续失败次数」还是「窗口失败占比」触发的降级，都沿用上述规则，
+    快速失败口径不会被固定成某一种；
+- 半开试探期间同样不跳变：
+  - 冷却后那个唯一试探请求走**真实调用**，按下游当时的真实结果分类
+    （仍超时/出错就是 504/502，恢复成功就是 200）；
+  - 试探请求在途时其余请求快速失败，口径沿用打开降级时的失败类别；
+  - 试探失败后重新 `open`，快速失败类别同步为这次试探的真实失败类别
+    （例如超时降级后、试探时下游真实返回错误，则该试探为 502，之后的
+    快速失败也随之是 502，与试探的真实结果一致）；
+  - 试探成功 -> `closed`，正常流量立即回到既有的成功/失败表现，无残留口径；
 - 不再逐个干等到超时：依赖持续不可用时快速失败请求毫秒级返回；
-- 关联标识从头到尾一致：响应头、错误响应体、结构化日志、回查档案是同一个值；
-- 快速失败请求仍按 502 计入既有指标分组（每请求恰好计一次），档案照常留存。
+- 错误响应体文案与同类真实失败逐字一致（超时为
+  `dependency call timed out after 0.2s`，出错为
+  `dependency returned an error`），不出现 `CircuitOpen`、熔断状态、
+  下游内部原因等字样；内部原因仅通过服务端日志的 `cause` 字段保留；
+- 同一次快速失败中，响应头、错误响应体、结构化日志（`request.failed` 的
+  `error_type`/`status_code`）和按请求标识回查到的档案（`status_code`/
+  `outcome`/`error_type`）看到的标识、分类、状态码是同一套；并发打到已
+  降级依赖时所有请求口径稳定（同一类失败不会出现 504/502 混杂）；
+- 快速失败请求仍按其状态码计入既有指标分组（每请求恰好计一次），档案照常留存。
 
-健康检查联动（`GET /health`）：响应体新增 `circuit` 判定快照（状态、连续失败数、
-窗口大小/失败数/失败率、冷却时长）；熔断 `open` 时依赖判为 `down`（503
-unavailable），`half_open` 时判为 `degraded`，`closed` 时沿用模拟模式的口径。
+健康检查联动（`GET /health`）：响应体携带 `circuit` 判定快照（状态、连续失败数、
+窗口大小/失败数/失败率、冷却时长、最近真实失败类别 `last_failure_kind`）；熔断
+`open` 时依赖判为 `down`（503 unavailable），`half_open` 时判为 `degraded`，
+`closed` 时沿用模拟模式的口径。
 
 ## 错误分类与状态码映射
 
@@ -149,8 +171,9 @@ unavailable），`half_open` 时判为 `degraded`，`closed` 时沿用模拟模�
 | 熔断 `open`（持续失败降级中） | `down` | `unavailable` | 503 |
 
 响应体额外携带 `circuit` 字段：`state` / `consecutive_failures` /
-`window_size` / `window_failures` / `window_fail_ratio` / `cooldown_s`，
-可看出“最近是不是在持续出问题”及当前判定依据。
+`window_size` / `window_failures` / `window_fail_ratio` / `cooldown_s` /
+`last_failure_kind`（最近一次真实失败类别 `timeout`/`error`，无则为 `null`，
+即快速失败当前会沿用的口径），可看出“最近是不是在持续出问题”及当前判定依据。
 
 ## 配置项（环境变量）
 
@@ -205,24 +228,47 @@ unavailable），`half_open` 时判为 `degraded`，`closed` 时沿用模拟模�
    ```bash
    export OBS_BREAKER_FAIL_THRESHOLD=3 OBS_BREAKER_COOLDOWN_S=3
    uv run uvicorn app.main:app --reload
-   # 依赖持续出错：连续打 3 次后熔断打开
+   # 7a. 依赖持续超时：连续 3 次 504 后熔断打开；第 4 次快速失败仍必须是 504
+   curl -X POST -H 'Content-Type: application/json' \
+     -d '{"mode":"timeout"}' http://127.0.0.1:8000/admin/dependency-mode
    for i in 1 2 3; do
-     curl -X POST -H 'Content-Type: application/json' \
-       -d '{"mode":"error"}' http://127.0.0.1:8000/admin/dependency-mode
-     curl -i -H "X-Correlation-ID: down-$i" http://127.0.0.1:8000/items/1
+     curl -i -H "X-Correlation-ID: timeout-down-$i" http://127.0.0.1:8000/items/1
+     # 前 3 次真实等待：-> 504 dependency_timeout
    done
-   curl -i http://127.0.0.1:8000/health   # -> 503，circuit.state=open
-   # 第 4 次起毫秒级快速失败，仍是 502 dependency_error，不等待超时
-   curl -i -H 'X-Correlation-ID: fast-fail-1' http://127.0.0.1:8000/items/1
-   curl http://127.0.0.1:8000/observability/requests/fast-fail-1
-   # 依赖恢复；冷却结束后第一个请求试探成功，健康检查回到 ok
+   curl -i -H 'X-Correlation-ID: timeout-fast-1' http://127.0.0.1:8000/items/1
+   # 第 4 次毫秒级快速失败：仍是 504 dependency_timeout（不跳成 502）
+   curl http://127.0.0.1:8000/observability/requests/timeout-fast-1
+   # 档案 status_code=504 / outcome=dependency_timeout / error_type=dependency_timeout
+   curl -s http://127.0.0.1:8000/health | python -m json.tool
+   # -> 503，circuit.state=open，last_failure_kind="timeout"
+
+   # 7b. 切到持续出错：连续 3 次 502 后熔断打开；快速失败同样是 502
+   curl -X POST -H 'Content-Type: application/json' \
+     -d '{"mode":"error"}' http://127.0.0.1:8000/admin/dependency-mode
+   for i in 1 2 3; do
+     curl -i -H "X-Correlation-ID: error-down-$i" http://127.0.0.1:8000/items/1
+     # -> 502 dependency_error
+   done
+   curl -i -H 'X-Correlation-ID: error-fast-1' http://127.0.0.1:8000/items/1
+   # 毫秒级快速失败：502 dependency_error（与真实出错口径一致）
+
+   # 7c. 依赖恢复；冷却结束后第一个请求试探成功，健康检查回到 ok
    curl -X POST -H 'Content-Type: application/json' \
      -d '{"mode":"ok"}' http://127.0.0.1:8000/admin/dependency-mode
    sleep 3
-   curl -i http://127.0.0.1:8000/items/1
-   curl -i http://127.0.0.1:8000/health   # -> 200，circuit.state=closed
+   curl -i http://127.0.0.1:8000/items/1   # 试探成功 -> 200
+   curl -i http://127.0.0.1:8000/health    # -> 200，circuit.state=closed
    ```
-8. 自动化验证：`uv run pytest -v -s`（用例打印输入与判定依据；
-   `tests/test_archive.py` 覆盖可查回/查不回、FIFO 淘汰、并发不丢不重、
-   各结果（含 500 兜底与快速失败）标识一致；`tests/test_resilience.py`
-   覆盖连续失败降级、窗口失败率、半开试探恢复/失败保持、并发稳定与快速失败口径）。
+   判定口径：同一类失败在真实调用与快速失败之间，HTTP 状态码、`error.type`、
+   响应头/响应体/日志/档案中的 `X-Correlation-ID` 必须一致，且响应体不出现
+   `CircuitOpen`、`circuit`、下游内部原因等字样。
+8. 自动化验证：`uv run pytest -v -s`（`-s` 会打印每个用例覆盖的业务与输入/
+   判定依据）。相关文件：
+   - `tests/test_resilience.py`：连续失败降级、窗口失败率、半开试探恢复/
+     失败保持、并发稳定与快速失败口径；
+   - `tests/test_fast_fail_classification.py`：本修复的专项回归——分别用持续
+     超时/持续出错（连续阈值与窗口失败率两种触发）打出降级后再发快速失败，
+     断言响应头/响应体/结构化日志/回查档案的标识、分类、状态码一致；覆盖
+     半开并发、冷却恢复口径不跳变与熔断器原子判定单元；
+   - `tests/test_archive.py`：档案可查回/查不回、FIFO 淘汰、并发不丢不重、
+     各结果（含 500 兜底与快速失败）标识一致。

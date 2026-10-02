@@ -6,7 +6,9 @@
 
 状态通过 set_mode 切换，健康检查据此报告 ok / degraded / down。
 熔断器（app.resilience）在此之上：连续失败或近期失败率过高时，
-fetch 不再真正等待下游，而是立即抛出 DependencyError（502 口径不变）快速失败。
+fetch 不再真正等待下游，而是立即快速失败。快速失败的对外分类/状态码与
+触发降级的那一类真实失败保持一致：持续超时打穿 -> dependency_timeout/504，
+持续出错打穿 -> dependency_error/502，不因不再等待下游而换类。
 """
 from __future__ import annotations
 
@@ -14,7 +16,12 @@ import asyncio
 import threading
 
 from app.errors import DependencyError, DependencyTimeout
-from app.resilience import CircuitOpen, breaker
+from app.resilience import (
+    FAILURE_ERROR,
+    FAILURE_TIMEOUT,
+    CircuitOpen,
+    breaker,
+)
 
 VALID_MODES = ("ok", "timeout", "error")
 
@@ -22,6 +29,10 @@ VALID_MODES = ("ok", "timeout", "error")
 TIMEOUT_BUDGET_S = 0.2
 #: timeout 模式下模拟的下游处理耗时（秒），大于超时预算
 SLOW_DEPENDENCY_S = 1.0
+
+#: 两类真实失败的对外文案；真实失败与同口径快速失败共用，保证响应体逐字一致
+TIMEOUT_MESSAGE = f"dependency call timed out after {TIMEOUT_BUDGET_S}s"
+ERROR_MESSAGE = "dependency returned an error"
 
 
 class SimulatedDependency:
@@ -46,13 +57,22 @@ class SimulatedDependency:
     async def fetch(self, key: str) -> dict:
         """模拟一次下游调用，按当前模式返回或抛出归一化异常。
 
-        熔断打开/半开排队中时立即快速失败（DependencyError/502），不等待下游、
-        不计入失败统计（CircuitOpen 路径不调用 record_*）。
+        熔断打开/半开排队中时立即快速失败，不等待下游、不计入失败统计
+        （快速失败路径不调用 record_*）。快速失败的错误分类/状态码与触发
+        降级的真实失败类别一致（超时 -> DependencyTimeout/504，出错 ->
+        DependencyError/502），且响应文案与同类真实失败逐字一致，不泄露
+        熔断、下游地址等内部细节。
         """
-        if not breaker.allow_request():
+        allowed, fast_fail_kind = breaker.check_request()
+        if not allowed:
             fast_fail = CircuitOpen("circuit open; fast-fail without calling downstream")
+            if fast_fail_kind == FAILURE_TIMEOUT:
+                raise DependencyTimeout(
+                    TIMEOUT_MESSAGE, cause=fast_fail
+                ) from fast_fail
+            # FAILURE_ERROR 以及尚未记录到类别的兜底情形，统一按下游出错口径
             raise DependencyError(
-                "dependency temporarily unavailable", cause=fast_fail
+                ERROR_MESSAGE, cause=fast_fail
             ) from fast_fail
         mode = self.mode
         try:
@@ -61,18 +81,18 @@ class SimulatedDependency:
                     await asyncio.wait_for(asyncio.sleep(SLOW_DEPENDENCY_S), timeout=TIMEOUT_BUDGET_S)
                 except TimeoutError as exc:
                     raise DependencyTimeout(
-                        f"dependency call timed out after {TIMEOUT_BUDGET_S}s", cause=exc
+                        TIMEOUT_MESSAGE, cause=exc
                     ) from exc
             elif mode == "error":
                 cause = RuntimeError("simulated downstream returned HTTP 500")
-                raise DependencyError("dependency returned an error", cause=cause) from cause
+                raise DependencyError(ERROR_MESSAGE, cause=cause) from cause
             else:
                 await asyncio.sleep(self._latency_ms / 1000.0)
         except DependencyError:
-            breaker.record_failure()
+            breaker.record_failure(FAILURE_ERROR)
             raise
         except DependencyTimeout:
-            breaker.record_failure()
+            breaker.record_failure(FAILURE_TIMEOUT)
             raise
         else:
             breaker.record_success()
